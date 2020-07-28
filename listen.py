@@ -91,8 +91,11 @@ def main(connect_timeout, client_timeout, server_timeout, base_port):
                 ip = addr[0]
                 player = motd[0]
                 port = motd[1]
-                if ip not in servers:
-                    print("New server from {} found at {}:{}".format(player, ip, port))
+
+                if ip in servers:
+                    continue
+
+                print("New server from {} found at {}:{}".format(player, ip, port))
                 servers[ip] = motd
 
                 servers_config = _generate_config(servers, base_port)
@@ -153,8 +156,8 @@ def _notify_haproxy():
             print("HAproxy process found: {}".format(proc))
             haproxy.append(proc)
 
-    #for p in haproxy:
-    #    p.send_signal(signal.SIGHUP)
+    for p in haproxy:
+        p.send_signal(signal.SIGHUP)
 
 
 if __name__ == "__main__":
