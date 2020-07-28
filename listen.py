@@ -93,7 +93,10 @@ def main(connect_timeout, client_timeout, server_timeout, base_port):
                 port = motd[1]
 
                 if ip in servers:
-                    continue
+                    existing_motd = servers[ip]
+                    if existing_motd[1] == port:
+                        print("Existing server {} omitted".format(player))
+                        continue
 
                 print("New server from {} found at {}:{}".format(player, ip, port))
                 servers[ip] = motd
