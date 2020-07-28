@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 # Multicast client
 # Adapted from: http://chaos.weblogs.us/archives/164
 
