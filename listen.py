@@ -2,77 +2,160 @@
 # Multicast client
 # Adapted from: http://chaos.weblogs.us/archives/164
 
-import socket, os, re
+import ipaddress
+import re
+import signal
+import socket
+import sys
 
-ADDR = os.popen("ip route get 1 | fgrep src | sed 's@.*src \\([0-9\\.]\+\\).*@\\1@g'").read().strip()
+import click
+import psutil
 
-LOCALPORT="6666"
+CONNECT_TIMEOUT_DEFAULT = 5000
+CLIENT_TIMEOUT_DEFAULT = 5000
+SERVER_TIMEOUT_DEFAULT = 50000
+BASE_PORT_DEFAULT = 25566
 
 ANY = "0.0.0.0"
-
-
-# Use this if you want this to listen to ANY system instead of only the local system
-# ADDR = ANY
 
 MCAST_ADDR = "224.0.2.60"
 MCAST_PORT = 4445
 
-# Create a UDP socket
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+HAPROXY_TEMPLATE = r"""
+# GENERATED CONFIG DON'T EDIT THIS MANUALLY
 
-# Allow multiple sockets to use the same PORT number
-sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+global
+    daemon
+    maxconn 256
 
-# Bind to the port that we know will receive multicast data
-sock.bind((ANY,MCAST_PORT))
+defaults
+    timeout connect {connect_timeout:d}ms
+    timeout client  {client_timeout:d}ms
+    timeout server  {server_timeout:d}ms
+    mode            tcp
+"""
 
-# Tell the kernel that we want to add ourselves to a multicast group
-# The address for the multicast group is the third param
-status = sock.setsockopt(socket.IPPROTO_IP,
-socket.IP_ADD_MEMBERSHIP,
-socket.inet_aton(MCAST_ADDR) + socket.inet_aton(ANY))
+HAPROXY_SERVER_TEMPLATE = r"""
+frontend front_{name}
+    bind            :{frontend_port}
+    default_backend back_{name}
 
-# setblocking(0) is equiv to settimeout(0.0) which means we poll the socket.
-# But this will raise an error if recv() or send() can't immediately find or send data.
-sock.setblocking(0)
+backend back_{name}
+    server minecraft_{name} {backend_host}:{backend_port}
+"""
 
-currentPort = "0"
 
-while 1:
-    try:
-        data, addr = sock.recvfrom(1024)
-    except socket.error as e:
-        pass
+@click.option("--connect-timeout", default=CONNECT_TIMEOUT_DEFAULT)
+@click.option("--client-timeout", default=CLIENT_TIMEOUT_DEFAULT)
+@click.option("--server-timeout", default=SERVER_TIMEOUT_DEFAULT)
+@click.option("--base-port", default=BASE_PORT_DEFAULT)
+@click.command()
+def main(connect_timeout, client_timeout, server_timeout, base_port):
+    # Create a UDP socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+
+    # Allow multiple sockets to use the same PORT number
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    # Bind to the port that we know will receive multicast data
+    sock.bind((ANY, MCAST_PORT))
+
+    # Tell the kernel that we want to add ourselves to a multicast group
+    # The address for the multicast group is the third param
+    status = sock.setsockopt(
+        socket.IPPROTO_IP,
+        socket.IP_ADD_MEMBERSHIP,
+        socket.inet_aton(MCAST_ADDR) + socket.inet_aton(ANY),
+    )
+
+    # setblocking(0) is equiv to settimeout(0.0) which means we poll the socket.
+    # But this will raise an error if recv() or send() can't immediately find or send data.
+    sock.setblocking(0)
+
+    servers = {}
+    config_preamble = HAPROXY_TEMPLATE.format(
+        connect_timeout=connect_timeout,
+        client_timeout=client_timeout,
+        server_timeout=server_timeout,
+    )
+
+    while 1:
+        try:
+            data, addr = sock.recvfrom(1024)
+        except socket.error as e:
+            pass
+        else:
+            motd = _parse_motd(data)
+            if motd:
+                print("Received from {} ---> {}".format(addr, data))
+                ip = addr[0]
+                player = motd[0]
+                port = motd[1]
+                if ip not in servers:
+                    print("New server from {} found at {}:{}".format(player, ip, port))
+                servers[ip] = motd
+
+                servers_config = _generate_config(servers, base_port)
+
+                with open("minecraftHaProxy.conf", "w") as f:
+                    f.write(config_preamble)
+                    f.write(servers_config)
+
+                _notify_haproxy()
+
+
+def _parse_motd(data: bytes):
+    if not data.startswith(b"[MOTD]"):
+        return None
+
+    # data is a string of the form
+    #  [MOTD]Player - Demo World[/MOTD][AD]41504[/AD]
+    match = re.search(b"\[MOTD\](.+?) - (.+?)\[/MOTD\]\[AD\](.+?)\[/AD\]", data)
+
+    if match:
+        player = match.group(1).decode("utf-8", errors="replace")
+        port = match.group(3)
+        try:
+            return player, int(port)
+        except:
+            return None
     else:
-        if addr[0] == ADDR:
-            print "Received ", ADDR, ": ", addr, " ---> ", data
-            # data is a string of the form
-            #  [MOTD]Player - Demo World[/MOTD][AD]41504[/AD]
-            match = re.search('\[AD\](.+?)\[/AD\]', data)
-            if match:
-                newPort = match.group(1)
+        return None
 
-                if (newPort != currentPort):
-                    print "NEW PORT:", newPort
-                    currentPort=newPort
 
-                    f = open("minecraftHaProxy.conf", "w")
-                    f.write("# GENERATED CONFIG DON'T EDIT THIS MANUALLY\n")
-                    f.write("\n")
+def _generate_config(servers, base_port):
+    configs = []
 
-                    f.write("defaults\n")
-                    f.write("    timeout connect 5000\n")
-                    f.write("    timeout client  5000\n")
-                    f.write("    timeout server  5000\n")
+    for ip, motd in servers.items():
+        address = ipaddress.ip_address(ip)
+        port_increment = int(str(address.reverse_pointer).split('.', maxsplit=1)[0])
 
-                    f.write("frontend outside\n")
-                    f.write("    bind :"+LOCALPORT+"\n")
-                    f.write("    mode tcp\n")
-                    f.write("    default_backend minecraft\n")
+        name = motd[0].lower().replace(" ", "_")
+        backend_port = motd[1]
+        frontend_port = base_port + port_increment
 
-                    f.write("backend minecraft\n")
-                    f.write("    server minecraft localhost:"+currentPort+"\n")
-                    f.close()
-                else:
-                    print "Keeping existing port:", newPort, "==", currentPort
+        server_config = HAPROXY_SERVER_TEMPLATE.format(
+            name=name,
+            frontend_port=frontend_port,
+            backend_host=ip,
+            backend_port=backend_port,
+        )
 
+        configs.append(server_config)
+
+    return "\n".join(configs)
+
+
+def _notify_haproxy():
+    haproxy = []
+    for proc in psutil.process_iter():
+        if "haproxy" in proc.name():
+            print("HAproxy process found: {}".format(proc))
+            haproxy.append(proc)
+
+    #for p in haproxy:
+    #    p.send_signal(signal.SIGHUP)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
